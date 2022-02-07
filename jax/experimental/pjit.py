@@ -236,7 +236,7 @@ def pjit(fun: Callable,
     # TODO(yashkatariya): This is a hack. This should go away when avals have
     # is_global attribute.
     in_positional_semantics = tuple(
-        maps._PositionalSemantics.GLOBAL if isinstance(a, GDA) else maps
+        maps.ps_thread_local_state._positional_semantics.GLOBAL if isinstance(a, GDA) else maps
         ._positional_semantics for a in args_flat)
     out_positional_semantics = maps._positional_semantics
     jaxpr, in_axis_resources_flat, out_axis_resources_flat = _pjit_jaxpr(
@@ -337,7 +337,7 @@ def _pjit_jaxpr(fun, mesh, local_in_avals,
 
   prev_positional = maps._positional_semantics
   try:
-    maps._positional_semantics = maps._PositionalSemantics.GLOBAL
+    maps._positional_semantics = maps.ps_thread_local_state._positional_semantics.GLOBAL
     with dispatch.log_elapsed_time(f"Finished tracing + transforming {fun.__name__} "
                                    "for pjit in {elapsed_time} sec"):
       jaxpr, global_out_avals, consts = pe.trace_to_jaxpr_dynamic(fun, global_in_avals)
@@ -568,7 +568,7 @@ def _pjit_lower(
   f = core.jaxpr_as_fun(jaxpr)
   f.__name__ = name
   fun = lu.wrap_init(f)
-  in_is_gda = [True if ips == maps._PositionalSemantics.GLOBAL else False
+  in_is_gda = [True if ips == maps.ps_thread_local_state._positional_semantics.GLOBAL else False
                for ips in in_positional_semantics]
   return pxla.lower_mesh_computation(
       fun, name, resource_env.physical_mesh,
@@ -972,14 +972,14 @@ def global_to_local(positional_semantics, mesh, avals, axes):
   if isinstance(positional_semantics, maps._PositionalSemantics):
     positional_semantics = [positional_semantics] * len(axes)
   return [
-      aval if ps == maps._PositionalSemantics.GLOBAL or aval_axes.partitions == () else mesh.global_to_local(
+      aval if ps == maps.ps_thread_local_state._positional_semantics.GLOBAL or aval_axes.partitions == () else mesh.global_to_local(
           get_array_mapping(aval_axes), aval)
       for aval, aval_axes, ps in safe_zip(avals, axes, positional_semantics)
   ]
 
 def local_to_global(positional_semantics, mesh, avals, axes):
   return [
-      aval if ps == maps._PositionalSemantics.GLOBAL or aval_axes.partitions == () else mesh.local_to_global(
+      aval if ps == maps.ps_thread_local_state._positional_semantics.GLOBAL or aval_axes.partitions == () else mesh.local_to_global(
           get_array_mapping(aval_axes), aval)
       for aval, aval_axes, ps in safe_zip(avals, axes, positional_semantics)
   ]

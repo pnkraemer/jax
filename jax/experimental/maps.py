@@ -63,7 +63,15 @@ class _PositionalSemantics(Enum):
   LOCAL = 0
   GLOBAL = 1
 
-_positional_semantics = _PositionalSemantics.LOCAL
+
+class _PSThreadLocalState(threading.local):
+
+  def __init__(self):
+    self._positional_semantics = _PositionalSemantics
+
+ps_thread_local_state = _PSThreadLocalState()
+
+_positional_semantics = ps_thread_local_state._positional_semantics.LOCAL
 
 map, unsafe_map = safe_map, map
 zip = safe_zip
@@ -709,7 +717,7 @@ def make_xmap_callable(fun: lu.WrappedFun,
                        global_axis_sizes, axis_resources, resource_env, backend,
                        spmd_in_axes, spmd_out_axes_thunk, positional_semantics,
                        *in_avals):
-  assert positional_semantics == _PositionalSemantics.LOCAL
+  assert positional_semantics == ps_thread_local_state._positional_semantics.LOCAL
   plan = EvaluationPlan.from_axis_resources(axis_resources, resource_env, global_axis_sizes)
 
   # TODO: Making axis substitution final style would allow us to avoid
@@ -1329,7 +1337,7 @@ def _xmap_lowering_rule_replica(ctx, *in_nodes,
   xla.check_backend_matches(backend, ctx.module_context.platform)
   # The only way for any of those two assertions to be violated is when xmap
   # is using the SPMD lowering, but then this rule shouldn't even trigger.
-  assert positional_semantics == _PositionalSemantics.LOCAL
+  assert positional_semantics == ps_thread_local_state._positional_semantics.LOCAL
   assert spmd_in_axes is None and spmd_out_axes is None
   plan = EvaluationPlan.from_axis_resources(axis_resources, resource_env, global_axis_sizes)
 
@@ -1513,7 +1521,7 @@ def _xmap_translation_rule_replica(ctx, avals_in, avals_out, *in_nodes,
   xla.check_backend_matches(backend, ctx.platform)
   # The only way for any of those two assertions to be violated is when xmap
   # is using the SPMD lowering, but then this rule shouldn't even trigger.
-  assert positional_semantics == _PositionalSemantics.LOCAL
+  assert positional_semantics == ps_thread_local_state._positional_semantics.LOCAL
   assert spmd_in_axes is None and spmd_out_axes is None
   plan = EvaluationPlan.from_axis_resources(axis_resources, resource_env, global_axis_sizes)
 
@@ -1731,18 +1739,18 @@ def _insert_aval_axes(aval, axes: AxisNamePos, local_axis_sizes):
 
 class ResourceCount(namedtuple('ResourceCount', ['semantics', 'nglobal', 'nlocal'])):
   def to_local(self, global_size):
-    if self.semantics == _PositionalSemantics.GLOBAL:
+    if self.semantics == ps_thread_local_state._positional_semantics.GLOBAL:
       return global_size
-    elif self.semantics == _PositionalSemantics.LOCAL:
+    elif self.semantics == ps_thread_local_state._positional_semantics.LOCAL:
       assert global_size % self.nglobal == 0, "Please report this issue!"
       return (global_size // self.nglobal) * self.nlocal
     else:
       raise AssertionError("Unhandled case {_positional_semantics}")
 
   def to_global(self, local_size):
-    if self.semantics == _PositionalSemantics.GLOBAL:
+    if self.semantics == ps_thread_local_state._positional_semantics.GLOBAL:
       return local_size
-    elif self.semantics == _PositionalSemantics.LOCAL:
+    elif self.semantics == ps_thread_local_state._positional_semantics.LOCAL:
       assert local_size % self.nlocal == 0, "Please report this issue!"
       return (local_size // self.nlocal) * self.nglobal
     else:
