@@ -1639,7 +1639,27 @@ def _rev(operand, *, dimensions):
 
 tf_impl[lax.rev_p] = _rev
 
-tf_impl[lax.select_p] = tf.where
+
+def _where(pred, *cases, _in_avals: Sequence[core.ShapedArray],
+           _out_aval: core.ShapedArray):
+  pred_aval = _in_avals[0]
+  if pred_aval.dtype == np.dtype(np.bool_):
+    assert len(cases) <= 2
+    return cases if len(cases) == 1 else tf.where(pred, cases[1], cases[0])
+
+  def _select(pred, offset, cases):
+    assert len(cases) > 0
+    if len(cases) == 1:
+      return cases[0]
+    mid = len(cases) // 2
+    return tf.where(tf.less(bool_shape, pred, offset + mid),
+                    _select(pred, offset, cases[:mid]),
+                    _select(pred, mid, cases[mid:]))
+
+  return _select(pred, 0, cases)
+
+
+tf_impl_with_avals[lax.select_n_p] = _where
 
 
 def _transpose(operand, *, permutation):

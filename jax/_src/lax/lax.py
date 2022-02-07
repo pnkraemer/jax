@@ -831,7 +831,35 @@ def select(pred: Array, on_true: Array, on_false: Array) -> Array:
   <https://www.tensorflow.org/xla/operation_semantics#select>`_
   operator.
   """
-  return select_p.bind(pred, on_true, on_false)
+  # Caution! The select_n_p primitive has the *opposite* order of arguments to
+  # select(). This is because it implements `select_n`.
+  return select_n_p.bind(pred, on_false, on_true)
+
+def select_n(pred: Array, *cases: Array) -> Array:
+  """Selects array values from multiple cases.
+
+  Generalizes XLA's `Select
+  <https://www.tensorflow.org/xla/operation_semantics#select>`_
+  operator. Unlike XLA's version, the operator is variadic and can select
+  from many cases using an integer `pred`.
+
+  Args:
+    pred: determines which case should be returned. Must be an array containing
+      either a boolean or integer values. May either be a scalar or have
+      shape matching ``cases``. For each array element, the value of ``pred``
+      determines which of ``cases`` is taken. ``pred`` must be in the range
+      ``[0 .. len(cases))``; for values outside that range the behavior is
+      implementation-defined.
+    *cases: a non-empty list of array cases. All must have equal dtypes and
+      equal shapes.
+  Returns:
+    An array with shape and dtype equal to the cases, whose values are chosen
+    according to ``pred``.
+  """
+  if len(cases) == 0:
+    raise ValueError("select_n() must have at least one case")
+  return select_n_p.bind(pred, *cases)
+
 
 def transpose(operand: Array, permutation: Sequence[int]) -> Array:
   """Wraps XLA's `Transpose
@@ -3157,101 +3185,157 @@ def _transpose_lower(ctx, x, *, permutation):
 mlir.register_lowering(transpose_p, _transpose_lower)
 
 
-def _select_shape_rule(pred, on_true, on_false):
-  if on_true.shape != on_false.shape:
-    msg = "select on_true and on_false must have the same shape, got {} and {}."
-    raise TypeError(msg.format(on_true.shape, on_false.shape))
-  if pred.shape and pred.shape != on_true.shape:
-    msg = ("select pred must be scalar or have the same shape as on_true and "
-           "on_false, got pred shape {} for on_true and on_false of shape {}.")
-    raise TypeError(msg.format(pred.shape, on_true.shape))
-  return on_true.shape
+def _select_shape_rule(pred, *cases):
+  if len(cases) == 0:
+    raise TypeError("select must have at least one case")
+  if any(case.shape != cases[0].shape for case in cases[1:]):
+    msg = "select cases must have the same shapes, got [{}]."
+    raise TypeError(msg.format(",".join(map(str(c.shape) for c in cases))))
+  if pred.shape and pred.shape != cases[0].shape:
+    msg = ("select predicate must be scalar or have the same shape as cases, "
+           "got pred shape {} but case shape {}.")
+    raise TypeError(msg.format(pred.shape, cases[0].shape))
+  return cases[0].shape
 
-def _select_dtype_rule(pred, on_true, on_false):
-  _check_same_dtypes("select", False, on_true.dtype, on_false.dtype)
-  if not dtypes.issubdtype(pred.dtype, np.bool_):
-    msg = "select pred must be boolean type, got {}."
-    raise TypeError(msg.format(pred.dtype))
-  return on_true.dtype
+def _select_dtype_rule(pred, *cases):
+  _check_same_dtypes("select", False, *(c.dtype for c in cases))
+  if (not dtypes.issubdtype(pred.dtype, np.bool_) and
+      not dtypes.issubdtype(pred.dtype, np.integer)):
+    raise TypeError("select pred must be boolean or integer type, got "
+                    f"{pred.dtype}.")
+  if dtypes.issubdtype(pred.dtype, np.bool_) and len(cases) > 2:
+    raise TypeError("select with boolean predicate cannot have > 2 cases.")
+  return cases[0].dtype
 
-def _select_transpose_rule(t, pred, on_true, on_false):
+def _select_weak_type_rule(pred, *cases):
+  return all(c.weak_type for c in cases)
+
+def _select_transpose_rule(t, pred, *cases):
   assert not ad.is_undefined_primal(pred)
   if type(t) is ad_util.Zero:
-    return [None,
-            ad_util.Zero(on_true.aval) if ad.is_undefined_primal(on_true) else None,
-            ad_util.Zero(on_false.aval) if ad.is_undefined_primal(on_false) else None]
+    return [None] + [ad_util.Zero(c.aval) if ad.is_undefined_primal(c) else None
+                     for c in cases]
   else:
     zeros = full_like(t, 0)
-    return [None,
-            select(pred, t, zeros) if ad.is_undefined_primal(on_true) else None,
-            select(pred, zeros, t) if ad.is_undefined_primal(on_false) else None]
+    return [None] + [
+        select(eq(pred, _const(pred, i)), t, zeros)
+        if ad.is_undefined_primal(case) else None
+        for i, case in enumerate(cases)
+    ]
 
 def _select_batch_rule(batched_args, batch_dims, **unused_kwargs):
-  pred, on_true, on_false, = batched_args
-  pred_bdim, ot_bdim, of_bdim = batch_dims
+  pred, *cases = batched_args
+  pred_bdim, *case_bdims = batch_dims
   size = next(x.shape[i] for x, i in zip(batched_args, batch_dims)
               if i is not None)
 
   # avoid transposes and some broadcasts in special cases
-  if pred_bdim == ot_bdim == of_bdim:
-    if np.shape(pred) == np.shape(on_true):
-      return select(pred, on_true, on_false), pred_bdim
+  if all(pred_bdim == bdim for bdim in case_bdims):
+    if np.shape(pred) == np.shape(cases[0]):
+      return select_n(pred, *cases), pred_bdim
     else:
       # vmapped function had a scalar pred with nonscalar args
       assert np.ndim(pred) == 1
-      pred = broadcast_in_dim(pred, on_true.shape, [pred_bdim])
-      return select(pred, on_true, on_false), pred_bdim
-  elif np.ndim(pred) == 0 and ot_bdim is not None and of_bdim is not None:
-    if ot_bdim == of_bdim:
-      return select(pred, on_true, on_false), ot_bdim
-    elif np.shape(on_true) == np.shape(on_false):
-      on_false = batching.moveaxis(on_false, of_bdim, ot_bdim)
-      return select(pred, on_true, on_false), ot_bdim
+      pred = broadcast_in_dim(pred, cases[0].shape, [pred_bdim])
+      return select_n(pred, *cases), pred_bdim
+  elif np.ndim(pred) == 0 and all(bdim is not None for bdim in case_bdims):
+    if all(case_bdims[0] == bdim for bdim in case_bdims[1:]):
+      return select_n(pred, *cases), case_bdims[0]
+    elif all(np.shape(cases[0]) == np.shape(c) for c in cases):
+      bdim = case_bdims[0]
+      other_cases = [batching.moveaxis(c, c_bdim, bdim)
+                     for c, c_bdim in zip(cases[1:], case_bdims[1:])]
+      return select_n(pred, cases[0], *other_cases), bdim
 
   pred = batching.bdim_at_front(pred, pred_bdim, size) if np.shape(pred) else pred
-  if not () == np.shape(on_true) == np.shape(on_false):
-    on_true = batching.bdim_at_front(on_true, ot_bdim, size)
-    on_false = batching.bdim_at_front(on_false, of_bdim, size)
-  assert np.shape(on_true) == np.shape(on_false)
-  if 0 < np.ndim(pred) < np.ndim(on_true):
+  if not all(() == np.shape(c) for c in cases):
+    cases = [batching.bdim_at_front(c, bdim, size)
+             for c, bdim in zip(cases, case_bdims)]
+  assert all(np.shape(cases[0]) == np.shape(c) for c in cases[1:])
+  if 0 < np.ndim(pred) < np.ndim(cases[0]):
     # vmapped function had a scalar pred with nonscalar args
     assert np.ndim(pred) == 1
-    pred = broadcast_in_dim(pred, on_true.shape, [0])
-  if np.ndim(pred) > np.ndim(on_true):
-    assert np.ndim(on_true) == 0
-    on_true = broadcast(on_true, pred.shape)
-    on_false = broadcast(on_false, pred.shape)
-  return select(pred, on_true, on_false), 0
+    pred = broadcast_in_dim(pred, cases[0].shape, [0])
+  if np.ndim(pred) > np.ndim(cases[0]):
+    assert np.ndim(cases[0]) == 0
+    cases = [broadcast(c, pred.shape) for c in cases]
+  return select_n(pred, *cases), 0
 
 def _select_masking_rule(padded_vals, logical_shapes):
   pred_shape, true_shape, false_shape = [
       masking.padded_shape_as_value(val.shape) for val in padded_vals]
   assert np.array_equal(pred_shape, true_shape)
   assert np.array_equal(pred_shape, false_shape)
-  return select(*padded_vals)
+  return select_n(*padded_vals)
 
 def _select_jvp(primals, tangents):
-  pred, on_true, on_false = primals
-  _, on_true_dot, on_false_dot = tangents
-  out = select(pred, on_true, on_false)
-  if type(on_true_dot) is ad_util.Zero:
-    if type(on_false_dot) is ad_util.Zero:
-      out_dot = ad_util.Zero(on_true_dot.aval)
-    else:
-      out_dot = select(pred, _zeros(on_false_dot), on_false_dot)
-  elif type(on_false_dot) is ad_util.Zero:
-    out_dot = select(pred, on_true_dot, _zeros(on_true_dot))
+  pred, *case_primals = primals
+  case_tangents = tangents[1:]
+  out = select_n(pred, *case_primals)
+  if all(type(t) is ad_util.Zero for t in case_tangents):
+    out_dot = ad_util.Zero(case_tangents[0].aval)
   else:
-    out_dot = select(pred, on_true_dot, on_false_dot)
+    z = _zeros(next(t for t in case_tangents if type(t) is not ad_util.Zero))
+    case_tangents = [z if type(t) is ad_util.Zero else t for t in case_tangents]
+    out_dot = select_n(pred, *case_tangents)
   return out, out_dot
 
-select_p = standard_primitive(_select_shape_rule, _select_dtype_rule, 'select',
-                              weak_type_rule=_argnum_weak_type(1, 2))
-ad.primitive_jvps[select_p] = _select_jvp
-ad.primitive_transposes[select_p] = _select_transpose_rule
-batching.primitive_batchers[select_p] = _select_batch_rule
-masking.masking_rules[select_p] = _select_masking_rule
-mlir.register_lowering(select_p, partial(_nary_lower_mhlo, mhlo.SelectOp))
+def _select_xla_translation(ctx, avals_in, avals_out, pred, *cases):
+  pred_aval = avals_in[0]
+  if pred_aval.dtype == np.dtype(np.bool_):
+    assert len(cases) <= 2
+    return cases if len(cases) == 1 else [xops.Select(pred, cases[1], cases[0])]
+
+  def _select(pred, offset, cases):
+    assert len(cases) > 0
+    if len(cases) == 1:
+      return cases[0]
+    mid = len(cases) // 2
+    which = xops.Lt(pred, xla.pyval_to_ir_constant(
+        ctx.builder, np.array(offset + mid, dtype=pred_aval.dtype)))
+    return xops.Select(which, _select(pred, offset, cases[:mid]),
+                         _select(pred, mid, cases[mid:]))
+
+  return [_select(pred, 0, cases)]
+
+
+def _select_mhlo_lowering(ctx, pred, *cases):
+  pred_aval = ctx.avals_in[0]
+  if pred_aval.dtype == np.dtype(np.bool_):
+    assert len(cases) <= 2
+    if len(cases) == 1: return cases
+    return mhlo.SelectOp(pred, cases[1], cases[0]).results
+
+  bool_shape = ir.RankedTensorType.get(pred_aval.shape,
+                                       ir.IntegerType.get_signless(1))
+  if dtypes.issubdtype(pred_aval.dtype, np.signedinteger):
+    compare_type = ir.StringAttr.get("SIGNED")
+  else:
+    compare_type = ir.StringAttr.get("UNSIGNED")
+  lt = ir.StringAttr.get("LT")
+
+  def _select(pred, offset, cases):
+    assert len(cases) > 0
+    if len(cases) == 1:
+      return cases[0]
+    mid = len(cases) // 2
+    which = mhlo.CompareOp(
+      bool_shape, pred, mlir.full_like_aval(offset + mid, pred_aval),
+      lt, compare_type)
+    return mhlo.SelectOp(which, _select(pred, offset, cases[:mid]),
+                         _select(pred, mid, cases[mid:])).result
+
+  return [_select(pred, 0, cases)]
+
+select_n_p = standard_primitive(
+    _select_shape_rule, _select_dtype_rule, 'select_n',
+    weak_type_rule=_select_weak_type_rule,
+    translation_rule=_select_xla_translation)
+ad.primitive_jvps[select_n_p] = _select_jvp
+ad.primitive_transposes[select_n_p] = _select_transpose_rule
+batching.primitive_batchers[select_n_p] = _select_batch_rule
+masking.masking_rules[select_n_p] = _select_masking_rule
+mlir.register_lowering(select_n_p, _select_mhlo_lowering)
 
 
 def _reduce_shape_rule(*avals, computation, jaxpr, consts, dimensions):
